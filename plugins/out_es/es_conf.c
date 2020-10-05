@@ -29,77 +29,6 @@
 #include "es.h"
 #include "es_conf.h"
 
-/* Configure in HA mode */
-int es_config_ha(const char *upstream_file,
-                 struct flb_elasticsearch *ctx,
-                 struct flb_config *config)
-{
-    ssize_t ret = 0;
-    const char *tmp;
-    const char *path;
-    struct mk_list *head;
-    struct flb_uri_field *f_index = NULL;
-    struct flb_uri_field *f_type = NULL;
-    struct flb_upstream_node *node;
-    struct flb_elasticsearch_config *ec = NULL;
-
-    ctx->ha_mode = FLB_TRUE;
-    ctx->ha = flb_upstream_ha_from_file(upstream_file, config);
-    if (!ctx->ha) {
-        flb_error("[out_es] cannot load Upstream file");
-        return -1;
-    }
-
-    /* Iterate nodes and create a forward_config context */
-    mk_list_foreach(head, &ctx->ha->nodes) {
-        node = mk_list_entry(head, struct flb_upstream_node, _head);
-
-        /* Allocate context */
-        ec = flb_calloc(1, sizeof(struct flb_elasticsearch_config));
-        if (!ec) {
-            flb_errno();
-            flb_error("[out_es] failed config allocation");
-            continue;
-        }
-
-        /* Set default values */
-        ret = flb_output_config_map_set(ctx->ins, ec);
-        if (ret == -1) {
-            flb_free(ec);
-            return -1;
-        }
-
-        /* Elasticsearch: Path */
-        path = flb_upstream_node_get_property("path", node);
-        if (!path) {
-            path = "";
-        }
-
-        /* Elasticsearch: Pipeline */
-        tmp = flb_upstream_node_get_property("pipeline", node);
-        if (tmp) {
-            snprintf(ec->uri, sizeof(ec->uri) - 1, "%s/_bulk/?pipeline=%s", path, tmp);
-        }
-        else {
-            snprintf(ec->uri, sizeof(ec->uri) - 1, "%s/_bulk", path);
-        }
-
-        /* Initialize and validate es_config context */
-        ret = flb_es_conf_init(ec, ctx);
-        if (ret == -1) {
-            if (ec) {
-                flb_es_conf_destroy(ec);
-            }
-            return -1;
-        }
-
-        /* Set our elasticsearch_config context into the node */
-        flb_upstream_node_set_data(ec, node);
-    }
-
-    return 0;
-}
-
 int es_config_simple(struct flb_elasticsearch *ctx,
                      struct flb_output_instance *ins,
                      struct flb_config *config)
@@ -235,12 +164,84 @@ int es_config_simple(struct flb_elasticsearch *ctx,
     return 0;
 }
 
+/* Configure in HA mode */
+int es_config_ha(const char *upstream_file,
+                 struct flb_elasticsearch *ctx,
+                 struct flb_config *config)
+{
+    ssize_t ret = 0;
+    const char *tmp;
+    const char *path;
+    struct mk_list *head;
+    struct flb_uri_field *f_index = NULL;
+    struct flb_uri_field *f_type = NULL;
+    struct flb_upstream_node *node;
+    struct flb_elasticsearch_config *ec = NULL;
+
+    ctx->ha_mode = FLB_TRUE;
+    ctx->ha = flb_upstream_ha_from_file(upstream_file, config);
+    if (!ctx->ha) {
+        flb_error("[out_es] cannot load Upstream file");
+        return -1;
+    }
+
+    /* Iterate nodes and create a forward_config context */
+    mk_list_foreach(head, &ctx->ha->nodes) {
+        node = mk_list_entry(head, struct flb_upstream_node, _head);
+
+        /* Allocate context */
+        ec = flb_calloc(1, sizeof(struct flb_elasticsearch_config));
+        if (!ec) {
+            flb_errno();
+            flb_error("[out_es] failed config allocation");
+            continue;
+        }
+
+        /* Set default values */
+        ret = flb_output_config_map_set(ctx->ins, ec);
+        if (ret == -1) {
+            flb_free(ec);
+            return -1;
+        }
+
+        /* Elasticsearch: Path */
+        path = flb_upstream_node_get_property("path", node);
+        if (!path) {
+            path = "";
+        }
+
+        /* Elasticsearch: Pipeline */
+        tmp = flb_upstream_node_get_property("pipeline", node);
+        if (tmp) {
+            snprintf(ec->uri, sizeof(ec->uri) - 1, "%s/_bulk/?pipeline=%s", path, tmp);
+        }
+        else {
+            snprintf(ec->uri, sizeof(ec->uri) - 1, "%s/_bulk", path);
+        }
+
+        /* Initialize and validate es_config context */
+        ret = flb_es_conf_init(ec, ctx);
+        if (ret == -1) {
+            if (ec) {
+                flb_es_conf_destroy(ec);
+            }
+            return -1;
+        }
+
+        /* Set our elasticsearch_config context into the node */
+        flb_upstream_node_set_data(ec, node);
+    }
+
+    return 0;
+}
+
 int flb_es_conf_init(struct flb_elasticsearch_config *ec,
                      struct flb_elasticsearch *ctx)
 {
   mk_list_add(&ec->_head, &ctx->configs);
   return 0;
 }
+
 int flb_es_conf_destroy(struct flb_elasticsearch_config *ec)
 {
     if (!ec) {
@@ -253,3 +254,4 @@ int flb_es_conf_destroy(struct flb_elasticsearch_config *ec)
 
     return 0;
 }
+
