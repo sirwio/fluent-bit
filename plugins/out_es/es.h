@@ -32,7 +32,16 @@
 #define FLB_ES_DEFAULT_TAG_KEY    "flb-key"
 #define FLB_ES_DEFAULT_HTTP_MAX   "512k"
 
-struct flb_elasticsearch {
+/*
+ * Configuration: we put this separate from the main
+ * context so every Upstream Node can have it own configuration
+ * reference and pass it smoothly to the required caller.
+ *
+ * On simple mode (no HA), the structure is referenced
+ * by flb_es->config. In HA mode the structure is referenced
+ * by the Upstream node context as an opaque data type.
+ */
+struct flb_elasticsearch_config {
     /* Elasticsearch index (database) and type (table) */
     char *index;
     char *type;
@@ -102,10 +111,20 @@ struct flb_elasticsearch {
     /* Elasticsearch HTTP API */
     char uri[256];
 
-    /* Upstream connection to the backend server */
-    struct flb_upstream *u;
+    /* Link to list flb_elasticsearch->configs */
+    struct mk_list _head;
+};
 
-    /* Plugin output instance reference */
+/* Plugin Context */
+struct flb_elasticsearch {
+    /* if HA mode is enabled */
+    int ha_mode;              /* High Availability mode enabled ? */
+    char *ha_upstream;        /* Upstream configuration file      */
+    struct flb_upstream_ha *ha;
+
+    /* Upstream handler and config context for single mode (no HA) */
+    struct flb_upstream *u;
+    struct mk_list configs;
     struct flb_output_instance *ins;
 };
 
