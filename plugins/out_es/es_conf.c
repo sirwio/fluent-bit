@@ -487,6 +487,8 @@ int es_config_ha(const char *upstream_file,
         flb_upstream_node_set_data(ec, node);
     }
 
+    flb_output_upstream_ha_set(ctx->ha, ctx->ins);
+
     return 0;
 }
 
