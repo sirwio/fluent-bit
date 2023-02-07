@@ -22,15 +22,17 @@
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_http_client.h>
 #include <fluent-bit/flb_record_accessor.h>
+#include <fluent-bit/flb_upstream.h>
+#include <fluent-bit/flb_upstream_ha.h>
 #include <fluent-bit/flb_signv4.h>
 #include <fluent-bit/flb_aws_credentials.h>
-#include <mbedtls/base64.h>
 
 #include "opensearch.h"
 #include "os_conf.h"
 
-struct flb_opensearch *flb_os_conf_create(struct flb_output_instance *ins,
-                                          struct flb_config *config)
+int os_config_simple(struct flb_opensearch *ctx,
+                     struct flb_output_instance *ins,
+                     struct flb_config *config)
 {
     int len;
     int io_flags = 0;
@@ -46,17 +48,17 @@ struct flb_opensearch *flb_os_conf_create(struct flb_output_instance *ins,
     struct flb_uri *uri = ins->host.uri;
     struct flb_uri_field *f_index = NULL;
     struct flb_uri_field *f_type = NULL;
+    struct flb_opensearch_config *oc = NULL;
     struct flb_upstream *upstream;
-    struct flb_opensearch *ctx;
 
     /* Allocate context */
-    ctx = flb_calloc(1, sizeof(struct flb_opensearch));
-    if (!ctx) {
+    oc = flb_calloc(1, sizeof(struct flb_opensearch_config));
+    if (!oc) {
         flb_errno();
-        return NULL;
+        return -1;
     }
-    ctx->ins = ins;
 
+    /* only used if the config has been set from the command line */
     if (uri) {
         if (uri->count >= 2) {
             f_index = flb_uri_get(uri, 0);
@@ -68,11 +70,11 @@ struct flb_opensearch *flb_os_conf_create(struct flb_output_instance *ins,
     flb_output_net_default("127.0.0.1", 9200, ins);
 
     /* Populate context with config map defaults and incoming properties */
-    ret = flb_output_config_map_set(ins, (void *) ctx);
+    ret = flb_output_config_map_set(ins, (void *) oc);
     if (ret == -1) {
         flb_plg_error(ctx->ins, "configuration error");
-        flb_os_conf_destroy(ctx);
-        return NULL;
+        flb_os_conf_destroy(oc);
+        return -1;
     }
 
     /* use TLS ? */
@@ -95,8 +97,8 @@ struct flb_opensearch *flb_os_conf_create(struct flb_output_instance *ins,
                                    ins->tls);
     if (!upstream) {
         flb_plg_error(ctx->ins, "cannot create Upstream context");
-        flb_os_conf_destroy(ctx);
-        return NULL;
+        flb_os_conf_destroy(oc);
+        return -1;
     }
     ctx->u = upstream;
 
@@ -105,16 +107,30 @@ struct flb_opensearch *flb_os_conf_create(struct flb_output_instance *ins,
 
     /* Set manual Index and Type */
     if (f_index) {
-        ctx->index = flb_strdup(f_index->value); /* FIXME */
+        oc->index = flb_strdup(f_index->value);
+    }
+    else {
+        /* Check if the index has been set in the configuration */
+        if (oc->index) {
+            /* do we have a record accessor pattern ? */
+            if (strchr(oc->index, '$')) {
+                oc->ra_index = flb_ra_create(oc->index, FLB_TRUE);
+                if (!oc->ra_index) {
+                    flb_plg_error(ctx->ins, "invalid record accessor pattern set for 'index' property");
+                    flb_os_conf_destroy(oc);
+                    return -1;
+                }
+            }
+        }
     }
 
     if (f_type) {
-        ctx->type = flb_strdup(f_type->value); /* FIXME */
+        oc->type = flb_strdup(f_type->value); /* FIXME */
     }
 
     /* HTTP Payload (response) maximum buffer size (0 == unlimited) */
-    if (ctx->buffer_size == -1) {
-        ctx->buffer_size = 0;
+    if (oc->buffer_size == -1) {
+        oc->buffer_size = 0;
     }
 
     /* Path */
@@ -126,133 +142,133 @@ struct flb_opensearch *flb_os_conf_create(struct flb_output_instance *ins,
     /* Pipeline */
     tmp = flb_output_get_property("pipeline", ins);
     if (tmp) {
-        snprintf(ctx->uri, sizeof(ctx->uri) - 1, "%s/_bulk/?pipeline=%s", path, tmp);
+        snprintf(oc->uri, sizeof(oc->uri) - 1, "%s/_bulk/?pipeline=%s", path, tmp);
     }
     else {
-        snprintf(ctx->uri, sizeof(ctx->uri) - 1, "%s/_bulk", path);
+        snprintf(oc->uri, sizeof(oc->uri) - 1, "%s/_bulk", path);
     }
 
 
-    if (ctx->id_key) {
-        ctx->ra_id_key = flb_ra_create(ctx->id_key, FLB_FALSE);
-        if (ctx->ra_id_key == NULL) {
+    if (oc->id_key) {
+        oc->ra_id_key = flb_ra_create(oc->id_key, FLB_FALSE);
+        if (oc->ra_id_key == NULL) {
             flb_plg_error(ins, "could not create record accessor for Id Key");
         }
-        if (ctx->generate_id == FLB_TRUE) {
+        if (oc->generate_id == FLB_TRUE) {
             flb_plg_warn(ins, "Generate_ID is ignored when ID_key is set");
-            ctx->generate_id = FLB_FALSE;
+            oc->generate_id = FLB_FALSE;
         }
     }
 
-    if (ctx->write_operation) {
-        if (strcasecmp(ctx->write_operation, FLB_OS_WRITE_OP_INDEX) == 0) {
-            ctx->action = FLB_OS_WRITE_OP_INDEX;
+    if (oc->write_operation) {
+        if (strcasecmp(oc->write_operation, FLB_OS_WRITE_OP_INDEX) == 0) {
+            oc->action = flb_strdup(FLB_OS_WRITE_OP_INDEX);
         }
-        else if (strcasecmp(ctx->write_operation, FLB_OS_WRITE_OP_CREATE) == 0) {
-            ctx->action = FLB_OS_WRITE_OP_CREATE;
+        else if (strcasecmp(oc->write_operation, FLB_OS_WRITE_OP_CREATE) == 0) {
+            oc->action = flb_strdup(FLB_OS_WRITE_OP_CREATE);
         }
-        else if (strcasecmp(ctx->write_operation, FLB_OS_WRITE_OP_UPDATE) == 0
-            || strcasecmp(ctx->write_operation, FLB_OS_WRITE_OP_UPSERT) == 0) {
-            ctx->action = FLB_OS_WRITE_OP_UPDATE;
+        else if (strcasecmp(oc->write_operation, FLB_OS_WRITE_OP_UPDATE) == 0
+            || strcasecmp(oc->write_operation, FLB_OS_WRITE_OP_UPSERT) == 0) {
+            oc->action = flb_strdup(FLB_OS_WRITE_OP_UPDATE);
         }
         else {
             flb_plg_error(ins,
                           "wrong Write_Operation (should be one of index, "
                           "create, update, upsert)");
-            flb_os_conf_destroy(ctx);
-            return NULL;
+            flb_os_conf_destroy(oc);
+            return -1;
         }
 
-        if (strcasecmp(ctx->action, FLB_OS_WRITE_OP_UPDATE) == 0
-            && !ctx->ra_id_key && ctx->generate_id == FLB_FALSE) {
+        if (strcasecmp(oc->action, FLB_OS_WRITE_OP_UPDATE) == 0
+            && !oc->ra_id_key && oc->generate_id == FLB_FALSE) {
             flb_plg_error(ins,
                           "id_key or generate_id must be set when Write_Operation "
                           "update or upsert");
-            flb_os_conf_destroy(ctx);
-            return NULL;
+            flb_os_conf_destroy(oc);
+            return -1;
         }
     }
 
-    if (ctx->logstash_prefix_key) {
-        if (ctx->logstash_prefix_key[0] != '$') {
-            len = flb_sds_len(ctx->logstash_prefix_key);
+    if (oc->logstash_prefix_key) {
+        if (oc->logstash_prefix_key[0] != '$') {
+            len = flb_sds_len(oc->logstash_prefix_key);
             buf = flb_malloc(len + 2);
             if (!buf) {
                 flb_errno();
-                flb_os_conf_destroy(ctx);
-                return NULL;
+                flb_os_conf_destroy(oc);
+                return -1;
             }
             buf[0] = '$';
-            memcpy(buf + 1, ctx->logstash_prefix_key, len);
+            memcpy(buf + 1, oc->logstash_prefix_key, len);
             buf[len + 1] = '\0';
 
-            ctx->ra_prefix_key = flb_ra_create(buf, FLB_TRUE);
+            oc->ra_prefix_key = flb_ra_create(buf, FLB_TRUE);
             flb_free(buf);
         }
         else {
-            ctx->ra_prefix_key = flb_ra_create(ctx->logstash_prefix_key, FLB_TRUE);
+            oc->ra_prefix_key = flb_ra_create(oc->logstash_prefix_key, FLB_TRUE);
         }
 
-        if (!ctx->ra_prefix_key) {
+        if (!oc->ra_prefix_key) {
             flb_plg_error(ins, "invalid logstash_prefix_key pattern '%s'", tmp);
-            flb_os_conf_destroy(ctx);
-            return NULL;
+            flb_os_conf_destroy(oc);
+            return -1;
         }
     }
 
 #ifdef FLB_HAVE_AWS
     /* AWS Auth */
-    ctx->has_aws_auth = FLB_FALSE;
+    oc->has_aws_auth = FLB_FALSE;
     tmp = flb_output_get_property("aws_auth", ins);
     if (tmp) {
         if (strncasecmp(tmp, "On", 2) == 0) {
-            ctx->has_aws_auth = FLB_TRUE;
+            oc->has_aws_auth = FLB_TRUE;
             flb_debug("[out_es] Enabled AWS Auth");
 
             /* AWS provider needs a separate TLS instance */
-            ctx->aws_tls = flb_tls_create(FLB_TRUE,
-                                          ins->tls_debug,
-                                          ins->tls_vhost,
-                                          ins->tls_ca_path,
-                                          ins->tls_ca_file,
-                                          ins->tls_crt_file,
-                                          ins->tls_key_file,
-                                          ins->tls_key_passwd);
-            if (!ctx->aws_tls) {
+            oc->aws_tls = flb_tls_create(FLB_TRUE,
+                                         ins->tls_debug,
+                                         ins->tls_vhost,
+                                         ins->tls_ca_path,
+                                         ins->tls_ca_file,
+                                         ins->tls_crt_file,
+                                         ins->tls_key_file,
+                                         ins->tls_key_passwd);
+            if (!oc->aws_tls) {
                 flb_errno();
-                flb_os_conf_destroy(ctx);
-                return NULL;
+                flb_os_conf_destroy(oc);
+                return -1;
             }
 
             tmp = flb_output_get_property("aws_region", ins);
             if (!tmp) {
                 flb_error("[out_es] aws_auth enabled but aws_region not set");
-                flb_os_conf_destroy(ctx);
-                return NULL;
+                flb_os_conf_destroy(oc);
+                return -1;
             }
-            ctx->aws_region = (char *) tmp;
+            oc->aws_region = (char *) tmp;
 
             tmp = flb_output_get_property("aws_sts_endpoint", ins);
             if (tmp) {
-                ctx->aws_sts_endpoint = (char *) tmp;
+                oc->aws_sts_endpoint = (char *) tmp;
             }
 
-            ctx->aws_provider = flb_standard_chain_provider_create(config,
-                                                                   ctx->aws_tls,
-                                                                   ctx->aws_region,
-                                                                   ctx->aws_sts_endpoint,
-                                                                   NULL,
-                                                                   flb_aws_client_generator());
-            if (!ctx->aws_provider) {
+            oc->aws_provider = flb_standard_chain_provider_create(config,
+                                                                  oc->aws_tls,
+                                                                  oc->aws_region,
+                                                                  oc->aws_sts_endpoint,
+                                                                  NULL,
+                                                                  flb_aws_client_generator());
+            if (!oc->aws_provider) {
                 flb_error("[out_es] Failed to create AWS Credential Provider");
-                flb_os_conf_destroy(ctx);
-                return NULL;
+                flb_os_conf_destroy(oc);
+                return -1;
             }
 
             tmp = flb_output_get_property("aws_role_arn", ins);
             if (tmp) {
                 /* Use the STS Provider */
-                ctx->base_aws_provider = ctx->aws_provider;
+                oc->base_aws_provider = oc->aws_provider;
                 aws_role_arn = (char *) tmp;
                 aws_external_id = NULL;
                 tmp = flb_output_get_property("aws_external_id", ins);
@@ -264,97 +280,231 @@ struct flb_opensearch *flb_os_conf_create(struct flb_output_instance *ins,
                 if (!aws_session_name) {
                     flb_error("[out_es] Failed to create aws iam role "
                               "session name");
-                    flb_os_conf_destroy(ctx);
-                    return NULL;
+                    flb_os_conf_destroy(oc);
+                    return -1;
                 }
 
                 /* STS provider needs yet another separate TLS instance */
-                ctx->aws_sts_tls = flb_tls_create(FLB_TRUE,
-                                                  ins->tls_debug,
-                                                  ins->tls_vhost,
-                                                  ins->tls_ca_path,
-                                                  ins->tls_ca_file,
-                                                  ins->tls_crt_file,
-                                                  ins->tls_key_file,
-                                                  ins->tls_key_passwd);
-                if (!ctx->aws_sts_tls) {
+                oc->aws_sts_tls = flb_tls_create(FLB_TRUE,
+                                                 ins->tls_debug,
+                                                 ins->tls_vhost,
+                                                 ins->tls_ca_path,
+                                                 ins->tls_ca_file,
+                                                 ins->tls_crt_file,
+                                                 ins->tls_key_file,
+                                                 ins->tls_key_passwd);
+                if (!oc->aws_sts_tls) {
                     flb_errno();
-                    flb_os_conf_destroy(ctx);
-                    return NULL;
+                    flb_os_conf_destroy(oc);
+                    return -1;
                 }
 
-                ctx->aws_provider = flb_sts_provider_create(config,
-                                                            ctx->aws_sts_tls,
-                                                            ctx->
-                                                            base_aws_provider,
-                                                            aws_external_id,
-                                                            aws_role_arn,
-                                                            aws_session_name,
-                                                            ctx->aws_region,
-                                                            ctx->aws_sts_endpoint,
-                                                            NULL,
-                                                            flb_aws_client_generator());
+                oc->aws_provider = flb_sts_provider_create(config,
+                                                           oc->aws_sts_tls,
+                                                           oc->
+                                                           base_aws_provider,
+                                                           aws_external_id,
+                                                           aws_role_arn,
+                                                           aws_session_name,
+                                                           oc->aws_region,
+                                                           oc->aws_sts_endpoint,
+                                                           NULL,
+                                                           flb_aws_client_generator());
                 /* Session name can be freed once provider is created */
                 flb_free(aws_session_name);
-                if (!ctx->aws_provider) {
+                if (!oc->aws_provider) {
                     flb_error("[out_es] Failed to create AWS STS Credential "
                               "Provider");
-                    flb_os_conf_destroy(ctx);
-                    return NULL;
+                    flb_os_conf_destroy(oc);
+                    return -1;
                 }
 
             }
 
             /* initialize credentials in sync mode */
-            ctx->aws_provider->provider_vtable->sync(ctx->aws_provider);
-            ctx->aws_provider->provider_vtable->init(ctx->aws_provider);
+            oc->aws_provider->provider_vtable->sync(oc->aws_provider);
+            oc->aws_provider->provider_vtable->init(oc->aws_provider);
             /* set back to async */
-            ctx->aws_provider->provider_vtable->async(ctx->aws_provider);
-            ctx->aws_provider->provider_vtable->upstream_set(ctx->aws_provider, ctx->ins);
+            oc->aws_provider->provider_vtable->async(oc->aws_provider);
+            oc->aws_provider->provider_vtable->upstream_set(oc->aws_provider, ctx->ins);
         }
     }
 #endif
 
-    return ctx;
+  /* Initialize and validate os_config context */
+  ret = flb_os_conf_init(oc, ctx);
+  if (ret == -1) {
+      if (oc) {
+          flb_os_conf_destroy(oc);
+      }
+      return -1;
+  }
+
+    return 0;
 }
 
-int flb_os_conf_destroy(struct flb_opensearch *ctx)
+/* Configure in HA mode */
+int os_config_ha(const char *upstream_file,
+                 struct flb_opensearch *ctx,
+                 struct flb_config *config)
 {
-    if (!ctx) {
+    ssize_t ret = 0;
+    const char *tmp;
+    const char *path;
+    struct mk_list *head;
+    struct flb_uri *uri = ctx->ins->host.uri;
+    struct flb_uri_field *f_index = NULL;
+    struct flb_uri_field *f_type = NULL;
+    struct flb_upstream_node *node;
+    struct flb_opensearch_config *oc = NULL;
+
+    ctx->ha_mode = FLB_TRUE;
+    ctx->ha = flb_upstream_ha_from_file(upstream_file, config);
+    if (!ctx->ha) {
+        flb_plg_error(ctx->ins, "cannot load Upstream file");
+        return -1;
+    }
+
+    if (uri) {
+        if (uri->count >= 2) {
+            f_index = flb_uri_get(uri, 0);
+            f_type  = flb_uri_get(uri, 1);
+        }
+    }
+
+    /* Iterate nodes and create a flb_opensearch_config context */
+    mk_list_foreach(head, &ctx->ha->nodes) {
+        node = mk_list_entry(head, struct flb_upstream_node, _head);
+
+        /* Allocate context */
+        oc = flb_calloc(1, sizeof(struct flb_opensearch_config));
+        if (!oc) {
+            flb_errno();
+            flb_plg_error(ctx->ins, "failed config allocation");
+            continue;
+        }
+
+        /* Set manual Index and Type */
+        if (f_index) {
+            oc->index = flb_strdup(f_index->value); /* FIXME */
+        }
+
+        if (f_type) {
+            oc->type = flb_strdup(f_type->value); /* FIXME */
+        }
+
+        /* Set default values */
+        ret = flb_output_config_map_set(ctx->ins, oc);
+        if (ret == -1) {
+            flb_free(oc);
+            return -1;
+        }
+
+        /* Opensearch: Path */
+        path = flb_upstream_node_get_property("path", node);
+        if (!path) {
+            path = "";
+        }
+
+        /* Opensearch: Pipeline */
+        tmp = flb_upstream_node_get_property("pipeline", node);
+        if (tmp) {
+            snprintf(oc->uri, sizeof(oc->uri) - 1, "%s/_bulk/?pipeline=%s", path, tmp);
+        }
+        else {
+            snprintf(oc->uri, sizeof(oc->uri) - 1, "%s/_bulk", path);
+        }
+
+        if (oc->write_operation) {
+          if (strcasecmp(oc->write_operation, FLB_OS_WRITE_OP_INDEX) == 0) {
+              oc->action = flb_strdup(FLB_OS_WRITE_OP_INDEX);
+          }
+          else if (strcasecmp(oc->write_operation, FLB_OS_WRITE_OP_CREATE) == 0) {
+              oc->action = flb_strdup(FLB_OS_WRITE_OP_CREATE);
+          }
+          else if (strcasecmp(oc->write_operation, FLB_OS_WRITE_OP_UPDATE) == 0
+              || strcasecmp(oc->write_operation, FLB_OS_WRITE_OP_UPSERT) == 0) {
+              oc->action = flb_strdup(FLB_OS_WRITE_OP_UPDATE);
+          }
+          else {
+              flb_plg_error(ctx->ins, "wrong Write_Operation (should be one of index, create, update, upsert)");
+              flb_os_conf_destroy(oc);
+              return -1;
+          }
+          if (strcasecmp(oc->action, FLB_OS_WRITE_OP_UPDATE) == 0
+              && !oc->ra_id_key && oc->generate_id == FLB_FALSE) {
+              flb_plg_error(ctx->ins, "Id_Key or Generate_Id must be set when Write_Operation update or upsert");
+              flb_os_conf_destroy(oc);
+              return -1;
+          }
+        }
+
+        /* Initialize and validate os_config context */
+        ret = flb_os_conf_init(oc, ctx);
+        if (ret == -1) {
+            if (oc) {
+                flb_os_conf_destroy(oc);
+            }
+            return -1;
+        }
+
+        /* Set our opensearch_config context into the node */
+        flb_upstream_node_set_data(oc, node);
+    }
+
+    flb_output_upstream_ha_set(ctx->ha, ctx->ins);
+
+    return 0;
+}
+
+int flb_os_conf_init(struct flb_opensearch_config *oc,
+                     struct flb_opensearch *ctx)
+{
+    mk_list_add(&oc->_head, &ctx->configs);
+    return 0;
+}
+
+int flb_os_conf_destroy(struct flb_opensearch_config *oc)
+{
+    if (!oc) {
         return 0;
     }
 
-    if (ctx->u) {
-        flb_upstream_destroy(ctx->u);
-    }
-    if (ctx->ra_id_key) {
-        flb_ra_destroy(ctx->ra_id_key);
-        ctx->ra_id_key = NULL;
+    if (oc->ra_id_key) {
+        flb_ra_destroy(oc->ra_id_key);
+        oc->ra_id_key = NULL;
     }
 
+    if (oc->action) {
+        flb_free(oc->action);
+    }
 #ifdef FLB_HAVE_AWS
-    if (ctx->base_aws_provider) {
-        flb_aws_provider_destroy(ctx->base_aws_provider);
+    if (oc->base_aws_provider) {
+        flb_aws_provider_destroy(oc->base_aws_provider);
     }
 
-    if (ctx->aws_provider) {
-        flb_aws_provider_destroy(ctx->aws_provider);
+    if (oc->aws_provider) {
+        flb_aws_provider_destroy(oc->aws_provider);
     }
 
-    if (ctx->aws_tls) {
-        flb_tls_destroy(ctx->aws_tls);
+    if (oc->aws_tls) {
+        flb_tls_destroy(oc->aws_tls);
     }
 
-    if (ctx->aws_sts_tls) {
-        flb_tls_destroy(ctx->aws_sts_tls);
+    if (oc->aws_sts_tls) {
+        flb_tls_destroy(oc->aws_sts_tls);
     }
 #endif
 
-    if (ctx->ra_prefix_key) {
-        flb_ra_destroy(ctx->ra_prefix_key);
+    if (oc->ra_prefix_key) {
+        flb_ra_destroy(oc->ra_prefix_key);
     }
 
-    flb_free(ctx);
+    if (oc->ra_index) {
+        flb_ra_destroy(oc->ra_index);
+    }
+
+    flb_free(oc);
 
     return 0;
 }

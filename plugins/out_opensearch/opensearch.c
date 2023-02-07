@@ -21,6 +21,8 @@
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_network.h>
 #include <fluent-bit/flb_http_client.h>
+#include <fluent-bit/flb_upstream.h>
+#include <fluent-bit/flb_upstream_ha.h>
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_time.h>
 #include <fluent-bit/flb_signv4.h>
@@ -37,21 +39,22 @@
 
 static int os_pack_array_content(msgpack_packer *tmp_pck,
                                  msgpack_object array,
-                                 struct flb_opensearch *ctx);
+                                 struct flb_opensearch_config *oc);
 
 #ifdef FLB_HAVE_AWS
 static flb_sds_t add_aws_auth(struct flb_http_client *c,
-                              struct flb_opensearch *ctx)
+                              struct flb_output_instance *ins,
+                              struct flb_opensearch_config *oc)
 {
     flb_sds_t signature = NULL;
     int ret;
 
-    flb_plg_debug(ctx->ins, "Signing request with AWS Sigv4");
+    flb_plg_debug(ins, "Signing request with AWS Sigv4");
 
     /* Amazon OpenSearch Sigv4 does not allow the host header to include the port */
     ret = flb_http_strip_port_from_host(c);
     if (ret < 0) {
-        flb_plg_error(ctx->ins, "could not strip port from host for sigv4");
+        flb_plg_error(ins, "could not strip port from host for sigv4");
         return NULL;
     }
 
@@ -59,11 +62,11 @@ static flb_sds_t add_aws_auth(struct flb_http_client *c,
     flb_http_add_header(c, "User-Agent", 10, "aws-fluent-bit-plugin", 21);
 
     signature = flb_signv4_do(c, FLB_TRUE, FLB_TRUE, time(NULL),
-                              ctx->aws_region, "es",
+                              oc->aws_region, "es",
                               0,
-                              ctx->aws_provider);
+                              oc->aws_provider);
     if (!signature) {
-        flb_plg_error(ctx->ins, "could not sign request with sigv4");
+        flb_plg_error(ins, "could not sign request with sigv4");
         return NULL;
     }
     return signature;
@@ -72,7 +75,7 @@ static flb_sds_t add_aws_auth(struct flb_http_client *c,
 
 static int os_pack_map_content(msgpack_packer *tmp_pck,
                                msgpack_object map,
-                               struct flb_opensearch *ctx)
+                               struct flb_opensearch_config *oc)
 {
     int i;
     char *ptr_key = NULL;
@@ -120,7 +123,7 @@ static int os_pack_map_content(msgpack_packer *tmp_pck,
          *
          *   https://goo.gl/R5NMTr
          */
-        if (ctx->replace_dots == FLB_TRUE) {
+        if (oc->replace_dots == FLB_TRUE) {
             char *p   = ptr_key;
             char *end = ptr_key + key_size;
             while (p != end) {
@@ -145,7 +148,7 @@ static int os_pack_map_content(msgpack_packer *tmp_pck,
          */
         if (v->type == MSGPACK_OBJECT_MAP) {
             msgpack_pack_map(tmp_pck, v->via.map.size);
-            os_pack_map_content(tmp_pck, *v, ctx);
+            os_pack_map_content(tmp_pck, *v, oc);
         }
         /*
          * The value can be any data type, if it's an array we need to
@@ -153,7 +156,7 @@ static int os_pack_map_content(msgpack_packer *tmp_pck,
          */
         else if (v->type == MSGPACK_OBJECT_ARRAY) {
           msgpack_pack_array(tmp_pck, v->via.array.size);
-          os_pack_array_content(tmp_pck, *v, ctx);
+          os_pack_array_content(tmp_pck, *v, oc);
         }
         else {
             msgpack_pack_object(tmp_pck, *v);
@@ -168,7 +171,7 @@ static int os_pack_map_content(msgpack_packer *tmp_pck,
   */
 static int os_pack_array_content(msgpack_packer *tmp_pck,
                                  msgpack_object array,
-                                 struct flb_opensearch *ctx)
+                                 struct flb_opensearch_config *oc)
 {
     int i;
     msgpack_object *e;
@@ -177,11 +180,11 @@ static int os_pack_array_content(msgpack_packer *tmp_pck,
         e = &array.via.array.ptr[i];
         if (e->type == MSGPACK_OBJECT_MAP) {
             msgpack_pack_map(tmp_pck, e->via.map.size);
-            os_pack_map_content(tmp_pck, *e, ctx);
+            os_pack_map_content(tmp_pck, *e, oc);
         }
         else if (e->type == MSGPACK_OBJECT_ARRAY) {
             msgpack_pack_array(tmp_pck, e->via.array.size);
-            os_pack_array_content(tmp_pck, *e, ctx);
+            os_pack_array_content(tmp_pck, *e, oc);
         }
         else {
             msgpack_pack_object(tmp_pck, *e);
@@ -195,20 +198,21 @@ static int os_pack_array_content(msgpack_packer *tmp_pck,
  * If it successed, return the value as flb_sds_t.
  * If it failed, return NULL.
 */
-static flb_sds_t os_get_id_value(struct flb_opensearch *ctx,
+static flb_sds_t os_get_id_value(struct flb_opensearch_config *oc,
+                                 struct flb_output_instance *ins,
                                  msgpack_object *map)
 {
     struct flb_ra_value *rval = NULL;
     flb_sds_t tmp_str;
-    rval = flb_ra_get_value_object(ctx->ra_id_key, *map);
+    rval = flb_ra_get_value_object(oc->ra_id_key, *map);
     if (rval == NULL) {
-        flb_plg_warn(ctx->ins, "the value of %s is missing",
-                     ctx->id_key);
+        flb_plg_warn(ins, "the value of %s is missing",
+                     oc->id_key);
         return NULL;
     }
     else if(rval->o.type != MSGPACK_OBJECT_STR) {
-        flb_plg_warn(ctx->ins, "the value of %s is not string",
-                     ctx->id_key);
+        flb_plg_warn(ins, "the value of %s is not string",
+                     oc->id_key);
         flb_ra_key_value_destroy(rval);
         return NULL;
     }
@@ -216,7 +220,7 @@ static flb_sds_t os_get_id_value(struct flb_opensearch *ctx,
     tmp_str = flb_sds_create_len(rval->o.via.str.ptr,
                                  rval->o.via.str.size);
     if (tmp_str == NULL) {
-        flb_plg_warn(ctx->ins, "cannot create ID string from record");
+        flb_plg_warn(ins, "cannot create ID string from record");
         flb_ra_key_value_destroy(rval);
         return NULL;
     }
@@ -232,6 +236,7 @@ static int opensearch_format(struct flb_config *config,
                              struct flb_input_instance *ins,
                              void *plugin_context,
                              void *flush_ctx,
+                             int event_type,
                              const char *tag, int tag_len,
                              const void *data, size_t bytes,
                              void **out_data, size_t *out_size)
@@ -242,10 +247,11 @@ static int opensearch_format(struct flb_config *config,
     int index_len = 0;
     int write_op_update = FLB_FALSE;
     int write_op_upsert = FLB_FALSE;
+    flb_sds_t ra_index = NULL;
     size_t s = 0;
     size_t off = 0;
     char *p;
-    char *index;
+    char *index = NULL;
     char logstash_index[256];
     char time_formatted[256];
     char index_formatted[256];
@@ -264,7 +270,8 @@ static int opensearch_format(struct flb_config *config,
     XXH128_hash_t hash;
     unsigned char h[sizeof(XXH128_hash_t)];
     int index_custom_len;
-    struct flb_opensearch *ctx = plugin_context;
+    struct flb_opensearch_config *oc = plugin_context;
+    struct flb_opensearch *ctx = flush_ctx;
     flb_sds_t j_index;
 
     j_index = flb_sds_create_size(FLB_OS_HEADER_SIZE);
@@ -315,9 +322,9 @@ static int opensearch_format(struct flb_config *config,
     msgpack_unpacked_init(&result);
 
     /* Copy logstash prefix if logstash format is enabled */
-    if (ctx->logstash_format == FLB_TRUE) {
-        memcpy(logstash_index, ctx->logstash_prefix, flb_sds_len(ctx->logstash_prefix));
-        logstash_index[flb_sds_len(ctx->logstash_prefix)] = '\0';
+    if (oc->logstash_format == FLB_TRUE) {
+        memcpy(logstash_index, oc->logstash_prefix, flb_sds_len(oc->logstash_prefix));
+        logstash_index[flb_sds_len(oc->logstash_prefix)] = '\0';
     }
 
     /*
@@ -327,25 +334,25 @@ static int opensearch_format(struct flb_config *config,
      * The header stored in 'j_index' will be used for the all records on
      * this payload.
      */
-    if (ctx->logstash_format == FLB_FALSE && ctx->generate_id == FLB_FALSE) {
+    if (oc->logstash_format == FLB_FALSE && oc->generate_id == FLB_FALSE && oc->ra_index == NULL) {
         flb_time_get(&tms);
         gmtime_r(&tms.tm.tv_sec, &tm);
         strftime(index_formatted, sizeof(index_formatted) - 1,
-                 ctx->index, &tm);
+                 oc->index, &tm);
         index = index_formatted;
-        if (ctx->suppress_type_name) {
+        if (oc->suppress_type_name) {
             index_len = flb_sds_snprintf(&j_index,
                                          flb_sds_alloc(j_index),
                                          OS_BULK_INDEX_FMT_NO_TYPE,
-                                         ctx->action,
+                                         oc->action,
                                          index);
         }
         else {
             index_len = flb_sds_snprintf(&j_index,
                                          flb_sds_alloc(j_index),
                                          OS_BULK_INDEX_FMT,
-                                         ctx->action,
-                                         index, ctx->type);
+                                         oc->action,
+                                         index, oc->type);
         }
 
         if (index_len == -1) {
@@ -362,7 +369,7 @@ static int opensearch_format(struct flb_config *config,
      * in order to prevent generating millions of indexes
      * we can set to always use current time for index generation
      */
-    if (ctx->current_time_index == FLB_TRUE) {
+    if (oc->current_time_index == FLB_TRUE) {
         flb_time_get(&tms);
     }
 
@@ -372,14 +379,14 @@ static int opensearch_format(struct flb_config *config,
             continue;
         }
 
-        /* Each array must have two entries: time and record */
+                /* Each ar have two entries: time and record */
         root = result.data;
         if (root.via.array.size != 2) {
             continue;
         }
 
         /* Only pop time from record if current_time_index is disabled */
-        if (ctx->current_time_index == FLB_FALSE) {
+        if (oc->current_time_index == FLB_FALSE) {
             flb_time_pop_from_msgpack(&tms, &result, &obj);
         }
 
@@ -387,8 +394,8 @@ static int opensearch_format(struct flb_config *config,
         map_size = map.via.map.size;
 
         index_custom_len = 0;
-        if (ctx->logstash_prefix_key) {
-            flb_sds_t v = flb_ra_translate(ctx->ra_prefix_key,
+        if (oc->logstash_prefix_key) {
+            flb_sds_t v = flb_ra_translate(oc->ra_prefix_key,
                                            (char *) tag, tag_len,
                                            map, NULL);
             if (v) {
@@ -409,7 +416,7 @@ static int opensearch_format(struct flb_config *config,
         msgpack_sbuffer_init(&tmp_sbuf);
         msgpack_packer_init(&tmp_pck, &tmp_sbuf, msgpack_sbuffer_write);
 
-        if (ctx->include_tag_key == FLB_TRUE) {
+        if (oc->include_tag_key == FLB_TRUE) {
             map_size++;
         }
 
@@ -417,14 +424,14 @@ static int opensearch_format(struct flb_config *config,
         msgpack_pack_map(&tmp_pck, map_size + 1);
 
         /* Append the time key */
-        msgpack_pack_str(&tmp_pck, flb_sds_len(ctx->time_key));
-        msgpack_pack_str_body(&tmp_pck, ctx->time_key, flb_sds_len(ctx->time_key));
+        msgpack_pack_str(&tmp_pck, flb_sds_len(oc->time_key));
+        msgpack_pack_str_body(&tmp_pck, oc->time_key, flb_sds_len(oc->time_key));
 
         /* Format the time */
         gmtime_r(&tms.tm.tv_sec, &tm);
         s = strftime(time_formatted, sizeof(time_formatted) - 1,
-                     ctx->time_key_format, &tm);
-        if (ctx->time_key_nanos) {
+                     oc->time_key_format, &tm);
+        if (oc->time_key_nanos) {
             len = snprintf(time_formatted + s, sizeof(time_formatted) - 1 - s,
                            ".%09" PRIu64 "Z", (uint64_t) tms.tm.tv_nsec);
         } else {
@@ -437,51 +444,87 @@ static int opensearch_format(struct flb_config *config,
         msgpack_pack_str(&tmp_pck, s);
         msgpack_pack_str_body(&tmp_pck, time_formatted, s);
 
-        index = ctx->index;
-        if (ctx->logstash_format == FLB_TRUE) {
+        index = oc->index;
+        if (oc->logstash_format == FLB_TRUE) {
             /* Compose Index header */
             if (index_custom_len > 0) {
                 p = logstash_index + index_custom_len;
             }
             else {
-                p = logstash_index + flb_sds_len(ctx->logstash_prefix);
+                p = logstash_index + flb_sds_len(oc->logstash_prefix);
             }
             *p++ = '-';
 
             len = p - logstash_index;
             s = strftime(p, sizeof(logstash_index) - len - 1,
-                         ctx->logstash_dateformat, &tm);
+                         oc->logstash_dateformat, &tm);
             p += s;
             *p++ = '\0';
             index = logstash_index;
-            if (ctx->generate_id == FLB_FALSE) {
-                if (ctx->suppress_type_name) {
+            if (oc->generate_id == FLB_FALSE) {
+                if (oc->suppress_type_name) {
                     index_len = flb_sds_snprintf(&j_index,
                                                  flb_sds_alloc(j_index),
                                                  OS_BULK_INDEX_FMT_NO_TYPE,
-                                                 ctx->action,
+                                                 oc->action,
                                                  index);
                 }
                 else {
                     index_len = flb_sds_snprintf(&j_index,
                                                  flb_sds_alloc(j_index),
                                                  OS_BULK_INDEX_FMT,
-                                                 ctx->action,
-                                                 index, ctx->type);
+                                                 oc->action,
+                                                 index, oc->type);
                 }
             }
         }
-        else if (ctx->current_time_index == FLB_TRUE) {
+        else if (oc->current_time_index == FLB_TRUE) {
             /* Make sure we handle index time format for index */
             strftime(index_formatted, sizeof(index_formatted) - 1,
-                     ctx->index, &tm);
+                     oc->index, &tm);
             index = index_formatted;
+        }
+        else if (oc->ra_index) {
+            // free any previous ra_index to avoid memory leaks.
+            if (ra_index != NULL) {
+                    flb_sds_destroy(ra_index);
+            }
+            /* a record accessor pattern exists for the index */
+            ra_index = flb_ra_translate(oc->ra_index,
+                                           (char *) tag, tag_len,
+                                           map, NULL);
+            if (!ra_index) {
+                flb_plg_warn(ctx->ins, "invalid index translation from record accessor pattern, default to static index");
+            }
+            else {
+                index = ra_index;
+            }
+
+            if (oc->suppress_type_name) {
+                index_len = flb_sds_snprintf(&j_index,
+                                             flb_sds_alloc(j_index),
+                                             OS_BULK_INDEX_FMT_NO_TYPE,
+                                             oc->action,
+                                             index);
+            }
+            else {
+                index_len = flb_sds_snprintf(&j_index,
+                                             flb_sds_alloc(j_index),
+                                             OS_BULK_INDEX_FMT,
+                                             oc->action,
+                                             index, oc->type);
+            }
+
+            flb_sds_destroy(ra_index);
+            ra_index = NULL;
+            index = NULL;
+
         }
 
         /* Tag Key */
-        if (ctx->include_tag_key == FLB_TRUE) {
-            msgpack_pack_str(&tmp_pck, flb_sds_len(ctx->tag_key));
-            msgpack_pack_str_body(&tmp_pck, ctx->tag_key, flb_sds_len(ctx->tag_key));
+        if (oc->include_tag_key == FLB_TRUE) {
+            msgpack_pack_str(&tmp_pck, flb_sds_len(oc->tag_key));
+            msgpack_pack_str_body(&tmp_pck, oc->tag_key, flb_sds_len(oc->tag_key));
             msgpack_pack_str(&tmp_pck, tag_len);
             msgpack_pack_str_body(&tmp_pck, tag, tag_len);
         }
@@ -493,7 +536,7 @@ static int opensearch_format(struct flb_config *config,
          * There is a restriction that key names cannot contain a dot; if some
          * dot is found, it's replaced with an underscore.
          */
-        ret = os_pack_map_content(&tmp_pck, map, ctx);
+        ret = os_pack_map_content(&tmp_pck, map, oc);
         if (ret == -1) {
             msgpack_unpacked_destroy(&result);
             msgpack_sbuffer_destroy(&tmp_sbuf);
@@ -502,7 +545,7 @@ static int opensearch_format(struct flb_config *config,
             return -1;
         }
 
-        if (ctx->generate_id == FLB_TRUE) {
+        if (oc->generate_id == FLB_TRUE) {
             /* use a 128 bit hash and copy it to a buffer */
             hash = XXH3_128bits(tmp_sbuf.data, tmp_sbuf.size);
             memcpy(h, &hash, sizeof(hash));
@@ -512,37 +555,37 @@ static int opensearch_format(struct flb_config *config,
                      h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7],
                      h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15]);
 
-            if (ctx->suppress_type_name) {
+            if (oc->suppress_type_name) {
                 index_len = flb_sds_snprintf(&j_index,
                                              flb_sds_alloc(j_index),
                                              OS_BULK_INDEX_FMT_ID_NO_TYPE,
-                                             ctx->action,
+                                             oc->action,
                                              index, uuid);
             }
             else {
                 index_len = flb_sds_snprintf(&j_index,
                                              flb_sds_alloc(j_index),
                                              OS_BULK_INDEX_FMT_ID,
-                                             ctx->action,
-                                             index, ctx->type, uuid);
+                                             oc->action,
+                                             index, oc->type, uuid);
             }
         }
-        if (ctx->ra_id_key) {
-            id_key_str = os_get_id_value(ctx ,&map);
+        if (oc->ra_id_key) {
+            id_key_str = os_get_id_value(oc, ctx->ins ,&map);
             if (id_key_str) {
-                if (ctx->suppress_type_name) {
+                if (oc->suppress_type_name) {
                     index_len = flb_sds_snprintf(&j_index,
                                                  flb_sds_alloc(j_index),
                                                  OS_BULK_INDEX_FMT_ID_NO_TYPE,
-                                                 ctx->action,
+                                                 oc->action,
                                                  index,  id_key_str);
                 }
                 else {
                     index_len = flb_sds_snprintf(&j_index,
                                                  flb_sds_alloc(j_index),
                                                  OS_BULK_INDEX_FMT_ID,
-                                                 ctx->action,
-                                                 index, ctx->type, id_key_str);
+                                                 oc->action,
+                                                 index, oc->type, id_key_str);
                 }
                 flb_sds_destroy(id_key_str);
                 id_key_str = NULL;
@@ -556,6 +599,7 @@ static int opensearch_format(struct flb_config *config,
             msgpack_unpacked_destroy(&result);
             flb_sds_destroy(bulk);
             flb_sds_destroy(j_index);
+            flb_sds_destroy(ra_index);
             return -1;
         }
 
@@ -570,10 +614,10 @@ static int opensearch_format(struct flb_config *config,
 
         }
 
-        if (strcasecmp(ctx->write_operation, FLB_OS_WRITE_OP_UPDATE) == 0) {
+        if (strcasecmp(oc->write_operation, FLB_OS_WRITE_OP_UPDATE) == 0) {
             write_op_update = FLB_TRUE;
         }
-        else if (strcasecmp(ctx->write_operation, FLB_OS_WRITE_OP_UPSERT) == 0) {
+        else if (strcasecmp(oc->write_operation, FLB_OS_WRITE_OP_UPSERT) == 0) {
             write_op_upsert = FLB_TRUE;
         }
 
@@ -618,7 +662,7 @@ static int opensearch_format(struct flb_config *config,
      * buffer with the data. Instead we just release the bulk context and
      * return the bulk->ptr buffer
      */
-    if (ctx->trace_output) {
+    if (oc->trace_output) {
         fwrite(*out_data, 1, *out_size, stdout);
         fflush(stdout);
     }
@@ -630,19 +674,29 @@ static int cb_opensearch_init(struct flb_output_instance *ins,
                               struct flb_config *config,
                               void *data)
 {
+    int ret = 0;
+    const char *tmp;
     struct flb_opensearch *ctx;
+    (void) data;
 
-    ctx = flb_os_conf_create(ins, config);
+    ctx = flb_calloc(1, sizeof(struct flb_opensearch));
     if (!ctx) {
         flb_plg_error(ins, "cannot initialize plugin");
         return -1;
     }
+    ctx->ins = ins;
 
-    flb_plg_debug(ctx->ins, "host=%s port=%i uri=%s index=%s type=%s",
-                  ins->host.name, ins->host.port, ctx->uri,
-                  ctx->index, ctx->type);
-
+    mk_list_init(&ctx->configs);
     flb_output_set_context(ins, ctx);
+
+    /* Configure HA or simple mode ? */
+    tmp = flb_output_get_property("upstream", ins);
+    if (tmp) {
+        ret = os_config_ha(tmp, ctx, config);
+    }
+    else {
+        ret = os_config_simple(ctx, ins, config);
+    }
 
     /*
      * This plugin instance uses the HTTP client interface, let's register
@@ -650,7 +704,7 @@ static int cb_opensearch_init(struct flb_output_instance *ins,
      */
     flb_output_set_http_debug_callbacks(ins);
 
-    return 0;
+    return ret;
 }
 
 static int opensearch_error_check(struct flb_opensearch *ctx,
@@ -817,19 +871,45 @@ static void cb_opensearch_flush(struct flb_event_chunk *event_chunk,
     size_t out_size;
     size_t b_sent;
     struct flb_opensearch *ctx = out_context;
+    struct flb_opensearch_config *oc = NULL;
     struct flb_upstream_conn *u_conn;
+    struct flb_upstream_node *node;
     struct flb_http_client *c;
     flb_sds_t signature = NULL;
 
+    if (ctx->ha_mode == FLB_TRUE) {
+        node = flb_upstream_ha_node_get(ctx->ha);
+        if (!node) {
+            flb_plg_error(ctx->ins, "cannot get an Upstream HA node");
+            FLB_OUTPUT_RETURN(FLB_RETRY);
+        }
+
+        /* Get forward_config stored in node opaque data */
+        oc = flb_upstream_node_get_data(node);
+        flb_plg_debug(ctx->ins, "trying node %s", node->name);
+    }
+    else {
+        oc = mk_list_entry_first(&ctx->configs,
+                                 struct flb_opensearch_config,
+                                 _head);
+    }
+
     /* Get upstream connection */
-    u_conn = flb_upstream_conn_get(ctx->u);
+    if (ctx->ha_mode == FLB_TRUE) {
+        u_conn = flb_upstream_conn_get(node->u);
+    }
+    else {
+        u_conn = flb_upstream_conn_get(ctx->u);
+    }
     if (!u_conn) {
+        flb_plg_error(ctx->ins, "no upstream connections available");
         FLB_OUTPUT_RETURN(FLB_RETRY);
     }
 
     /* Convert format */
     ret = opensearch_format(config, ins,
-                               ctx, NULL,
+                               oc, ctx,
+                               event_chunk->type,
                                event_chunk->tag, flb_sds_len(event_chunk->tag),
                                event_chunk->data, event_chunk->size,
                                &out_buf, &out_size);
@@ -842,10 +922,10 @@ static void cb_opensearch_flush(struct flb_event_chunk *event_chunk,
     pack_size = out_size;
 
     /* Compose HTTP Client request */
-    c = flb_http_client(u_conn, FLB_HTTP_POST, ctx->uri,
+    c = flb_http_client(u_conn, FLB_HTTP_POST, oc->uri,
                         pack, pack_size, NULL, 0, NULL, 0);
 
-    flb_http_buffer_size(c, ctx->buffer_size);
+    flb_http_buffer_size(c, oc->buffer_size);
 
 #ifndef FLB_HAVE_AWS
     flb_http_add_header(c, "User-Agent", 10, "Fluent-Bit", 10);
@@ -853,13 +933,13 @@ static void cb_opensearch_flush(struct flb_event_chunk *event_chunk,
 
     flb_http_add_header(c, "Content-Type", 12, "application/x-ndjson", 20);
 
-    if (ctx->http_user && ctx->http_passwd) {
-        flb_http_basic_auth(c, ctx->http_user, ctx->http_passwd);
+    if (oc->http_user && oc->http_passwd) {
+        flb_http_basic_auth(c, oc->http_user, oc->http_passwd);
     }
 
 #ifdef FLB_HAVE_AWS
-    if (ctx->has_aws_auth == FLB_TRUE) {
-        signature = add_aws_auth(c, ctx);
+    if (oc->has_aws_auth == FLB_TRUE) {
+        signature = add_aws_auth(c, ctx->ins, oc);
         if (!signature) {
             goto retry;
         }
@@ -874,20 +954,20 @@ static void cb_opensearch_flush(struct flb_event_chunk *event_chunk,
 
     ret = flb_http_do(c, &b_sent);
     if (ret != 0) {
-        flb_plg_warn(ctx->ins, "http_do=%i URI=%s", ret, ctx->uri);
+        flb_plg_warn(ctx->ins, "http_do=%i URI=%s", ret, oc->uri);
         goto retry;
     }
     else {
         /* The request was issued successfully, validate the 'error' field */
-        flb_plg_debug(ctx->ins, "HTTP Status=%i URI=%s", c->resp.status, ctx->uri);
+        flb_plg_debug(ctx->ins, "HTTP Status=%i URI=%s", c->resp.status, oc->uri);
         if (c->resp.status != 200 && c->resp.status != 201) {
             if (c->resp.payload_size > 0) {
                 flb_plg_error(ctx->ins, "HTTP status=%i URI=%s, response:\n%s\n",
-                              c->resp.status, ctx->uri, c->resp.payload);
+                              c->resp.status, oc->uri, c->resp.payload);
             }
             else {
                 flb_plg_error(ctx->ins, "HTTP status=%i URI=%s",
-                              c->resp.status, ctx->uri);
+                              c->resp.status, oc->uri);
             }
             goto retry;
         }
@@ -900,7 +980,7 @@ static void cb_opensearch_flush(struct flb_event_chunk *event_chunk,
             ret = opensearch_error_check(ctx, c);
             if (ret == FLB_TRUE) {
                 /* we got an error */
-                if (ctx->trace_error) {
+                if (oc->trace_error) {
                     /*
                      * If trace_error is set, trace the actual
                      * response from Elasticsearch explaining the problem.
@@ -954,8 +1034,34 @@ static void cb_opensearch_flush(struct flb_event_chunk *event_chunk,
 static int cb_opensearch_exit(void *data, struct flb_config *config)
 {
     struct flb_opensearch *ctx = data;
+    struct flb_opensearch_config *oc;
+    struct mk_list *head;
+    struct mk_list *tmp;
+    (void) config;
 
-    flb_os_conf_destroy(ctx);
+    if (!ctx) {
+        return 0;
+    }
+
+    /* Destroy opensearch_config contexts */
+    mk_list_foreach_safe(head, tmp, &ctx->configs) {
+        oc = mk_list_entry(head, struct flb_opensearch_config, _head);
+        mk_list_del(&oc->_head);
+        flb_os_conf_destroy(oc);
+    }
+
+    if (ctx->ha_mode == FLB_TRUE) {
+        if (ctx->ha) {
+            flb_upstream_ha_destroy(ctx->ha);
+        }
+    }
+    else {
+        if (ctx->u) {
+            flb_upstream_destroy(ctx->u);
+        }
+    }
+    flb_free(ctx);
+
     return 0;
 }
 
@@ -963,29 +1069,29 @@ static int cb_opensearch_exit(void *data, struct flb_config *config)
 static struct flb_config_map config_map[] = {
     {
      FLB_CONFIG_MAP_STR, "index", FLB_OS_DEFAULT_INDEX,
-     0, FLB_TRUE, offsetof(struct flb_opensearch, index),
+     0, FLB_TRUE, offsetof(struct flb_opensearch_config, index),
      "Set an index name"
     },
     {
      FLB_CONFIG_MAP_STR, "type", FLB_OS_DEFAULT_TYPE,
-     0, FLB_TRUE, offsetof(struct flb_opensearch, type),
+     0, FLB_TRUE, offsetof(struct flb_opensearch_config, type),
      "Set the document type property"
     },
     {
      FLB_CONFIG_MAP_BOOL, "suppress_type_name", "false",
-     0, FLB_TRUE, offsetof(struct flb_opensearch, suppress_type_name),
+     0, FLB_TRUE, offsetof(struct flb_opensearch_config, suppress_type_name),
      "If true, mapping types is removed. (for v7.0.0 or later)"
     },
 
     /* HTTP Authentication */
     {
      FLB_CONFIG_MAP_STR, "http_user", NULL,
-     0, FLB_TRUE, offsetof(struct flb_opensearch, http_user),
+     0, FLB_TRUE, offsetof(struct flb_opensearch_config, http_user),
      "Optional username credential for access"
     },
     {
      FLB_CONFIG_MAP_STR, "http_passwd", "",
-     0, FLB_TRUE, offsetof(struct flb_opensearch, http_passwd),
+     0, FLB_TRUE, offsetof(struct flb_opensearch_config, http_passwd),
      "Password for user defined in 'http_user'"
     },
 
@@ -993,17 +1099,17 @@ static struct flb_config_map config_map[] = {
 #ifdef FLB_HAVE_AWS
     {
      FLB_CONFIG_MAP_BOOL, "aws_auth", "false",
-     0, FLB_TRUE, offsetof(struct flb_opensearch, has_aws_auth),
+     0, FLB_TRUE, offsetof(struct flb_opensearch_config, has_aws_auth),
      "Enable AWS Sigv4 Authentication"
     },
     {
      FLB_CONFIG_MAP_STR, "aws_region", NULL,
-     0, FLB_TRUE, offsetof(struct flb_opensearch, aws_region),
+     0, FLB_TRUE, offsetof(struct flb_opensearch_config, aws_region),
      "AWS Region of your Amazon OpenSearch Service cluster"
     },
     {
      FLB_CONFIG_MAP_STR, "aws_sts_endpoint", NULL,
-     0, FLB_TRUE, offsetof(struct flb_opensearch, aws_sts_endpoint),
+     0, FLB_TRUE, offsetof(struct flb_opensearch_config, aws_sts_endpoint),
      "Custom endpoint for the AWS STS API, used with the AWS_Role_ARN option"
     },
     {
@@ -1021,12 +1127,12 @@ static struct flb_config_map config_map[] = {
     /* Logstash compatibility */
     {
      FLB_CONFIG_MAP_BOOL, "logstash_format", "false",
-     0, FLB_TRUE, offsetof(struct flb_opensearch, logstash_format),
+     0, FLB_TRUE, offsetof(struct flb_opensearch_config, logstash_format),
      "Enable Logstash format compatibility"
     },
     {
      FLB_CONFIG_MAP_STR, "logstash_prefix", FLB_OS_DEFAULT_PREFIX,
-     0, FLB_TRUE, offsetof(struct flb_opensearch, logstash_prefix),
+     0, FLB_TRUE, offsetof(struct flb_opensearch_config, logstash_prefix),
      "When Logstash_Format is enabled, the Index name is composed using a prefix "
      "and the date, e.g: If Logstash_Prefix is equals to 'mydata' your index will "
      "become 'mydata-YYYY.MM.DD'. The last string appended belongs to the date "
@@ -1034,7 +1140,7 @@ static struct flb_config_map config_map[] = {
     },
     {
      FLB_CONFIG_MAP_STR, "logstash_prefix_key", NULL,
-     0, FLB_TRUE, offsetof(struct flb_opensearch, logstash_prefix_key),
+     0, FLB_TRUE, offsetof(struct flb_opensearch_config, logstash_prefix_key),
      "When included: the value in the record that belongs to the key will be looked "
      "up and over-write the Logstash_Prefix for index generation. If the key/value "
      "is not found in the record then the Logstash_Prefix option will act as a "
@@ -1042,42 +1148,42 @@ static struct flb_config_map config_map[] = {
     },
     {
      FLB_CONFIG_MAP_STR, "logstash_dateformat", FLB_OS_DEFAULT_TIME_FMT,
-     0, FLB_TRUE, offsetof(struct flb_opensearch, logstash_dateformat),
+     0, FLB_TRUE, offsetof(struct flb_opensearch_config, logstash_dateformat),
      "Time format (based on strftime) to generate the second part of the Index name"
     },
 
     /* Custom Time and Tag keys */
     {
      FLB_CONFIG_MAP_STR, "time_key", FLB_OS_DEFAULT_TIME_KEY,
-     0, FLB_TRUE, offsetof(struct flb_opensearch, time_key),
+     0, FLB_TRUE, offsetof(struct flb_opensearch_config, time_key),
      "When Logstash_Format is enabled, each record will get a new timestamp field. "
      "The Time_Key property defines the name of that field"
     },
     {
      FLB_CONFIG_MAP_STR, "time_key_format", FLB_OS_DEFAULT_TIME_KEYF,
-     0, FLB_TRUE, offsetof(struct flb_opensearch, time_key_format),
+     0, FLB_TRUE, offsetof(struct flb_opensearch_config, time_key_format),
      "When Logstash_Format is enabled, this property defines the format of the "
      "timestamp"
     },
     {
      FLB_CONFIG_MAP_BOOL, "time_key_nanos", "false",
-     0, FLB_TRUE, offsetof(struct flb_opensearch, time_key_nanos),
+     0, FLB_TRUE, offsetof(struct flb_opensearch_config, time_key_nanos),
      "When Logstash_Format is enabled, enabling this property sends nanosecond "
      "precision timestamps"
     },
     {
      FLB_CONFIG_MAP_BOOL, "include_tag_key", "false",
-     0, FLB_TRUE, offsetof(struct flb_opensearch, include_tag_key),
+     0, FLB_TRUE, offsetof(struct flb_opensearch_config, include_tag_key),
      "When enabled, it append the Tag name to the record"
     },
     {
      FLB_CONFIG_MAP_STR, "tag_key", FLB_OS_DEFAULT_TAG_KEY,
-     0, FLB_TRUE, offsetof(struct flb_opensearch, tag_key),
+     0, FLB_TRUE, offsetof(struct flb_opensearch_config, tag_key),
      "When Include_Tag_Key is enabled, this property defines the key name for the tag"
     },
     {
      FLB_CONFIG_MAP_SIZE, "buffer_size", FLB_OS_DEFAULT_HTTP_MAX,
-     0, FLB_TRUE, offsetof(struct flb_opensearch, buffer_size),
+     0, FLB_TRUE, offsetof(struct flb_opensearch_config, buffer_size),
      "Specify the buffer size used to read the response from the OpenSearch HTTP "
      "service. This option is useful for debugging purposes where is required to read "
      "full responses, note that response size grows depending of the number of records "
@@ -1104,42 +1210,47 @@ static struct flb_config_map config_map[] = {
     },
     {
      FLB_CONFIG_MAP_BOOL, "generate_id", "false",
-     0, FLB_TRUE, offsetof(struct flb_opensearch, generate_id),
+     0, FLB_TRUE, offsetof(struct flb_opensearch_config, generate_id),
      "When enabled, generate _id for outgoing records. This prevents duplicate "
      "records when retrying"
     },
     {
      FLB_CONFIG_MAP_STR, "write_operation", "create",
-     0, FLB_TRUE, offsetof(struct flb_opensearch, write_operation),
+     0, FLB_TRUE, offsetof(struct flb_opensearch_config, write_operation),
      "Operation to use to write in bulk requests"
     },
     {
      FLB_CONFIG_MAP_STR, "id_key", NULL,
-     0, FLB_TRUE, offsetof(struct flb_opensearch, id_key),
+     0, FLB_TRUE, offsetof(struct flb_opensearch_config, id_key),
      "If set, _id will be the value of the key from incoming record."
     },
     {
      FLB_CONFIG_MAP_BOOL, "replace_dots", "false",
-     0, FLB_TRUE, offsetof(struct flb_opensearch, replace_dots),
+     0, FLB_TRUE, offsetof(struct flb_opensearch_config, replace_dots),
      "When enabled, replace field name dots with underscore."
     },
 
     {
      FLB_CONFIG_MAP_BOOL, "current_time_index", "false",
-     0, FLB_TRUE, offsetof(struct flb_opensearch, current_time_index),
+     0, FLB_TRUE, offsetof(struct flb_opensearch_config, current_time_index),
      "Use current time for index generation instead of message record"
     },
 
     /* Trace */
     {
      FLB_CONFIG_MAP_BOOL, "trace_output", "false",
-     0, FLB_TRUE, offsetof(struct flb_opensearch, trace_output),
+     0, FLB_TRUE, offsetof(struct flb_opensearch_config, trace_output),
      "When enabled print the OpenSearch API calls to stdout (for diag only)"
     },
     {
      FLB_CONFIG_MAP_BOOL, "trace_error", "false",
-     0, FLB_TRUE, offsetof(struct flb_opensearch, trace_error),
+     0, FLB_TRUE, offsetof(struct flb_opensearch_config, trace_error),
      "When enabled print the OpenSearch exception to stderr (for diag only)"
+    },
+    {
+     FLB_CONFIG_MAP_BOOL, "upstream", NULL,
+     0, FLB_FALSE, 0,
+     "Path to 'upstream' configuration file (define multiple nodes)" 
     },
 
     /* EOF */
@@ -1154,6 +1265,7 @@ struct flb_output_plugin out_opensearch_plugin = {
     .cb_pre_run     = NULL,
     .cb_flush       = cb_opensearch_flush,
     .cb_exit        = cb_opensearch_exit,
+    .workers        = 2,
 
     /* Configuration */
     .config_map     = config_map,
