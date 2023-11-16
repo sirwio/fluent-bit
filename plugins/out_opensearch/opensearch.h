@@ -55,7 +55,16 @@
 #define FLB_OS_COMPRESSION_NONE 0
 #define FLB_OS_COMPRESSION_GZIP 1
 
-struct flb_opensearch {
+/*
+ * Configuration: we put this separate from the main
+ * context so every Upstream Node can have it own configuration
+ * reference and pass it smoothly to the required caller.
+ *
+ * On simple mode (no HA), the structure is referenced
+ * by flb_es->config. In HA mode the structure is referenced
+ * by the Upstream node context as an opaque data type.
+ */
+struct flb_opensearch_config {
     /* OpenSearch index (database) and type (table) */
     flb_sds_t index;
     struct flb_record_accessor *ra_index;
@@ -141,15 +150,28 @@ struct flb_opensearch {
 
     struct flb_record_accessor *ra_prefix_key;
 
-    /* Upstream connection to the backend server */
-    struct flb_upstream *u;
-
-    /* Plugin output instance reference */
-    struct flb_output_instance *ins;
-
     /* Compression algorithm */
     int compression;
     flb_sds_t compression_str;
+
+    /* Link to list flb_opensearch->configs */
+    struct mk_list _head;
 };
+
+/* Plugin Context */
+struct flb_opensearch {
+    /* if HA mode is enabled */
+    int ha_mode;              /* High Availability mode enabled ? */
+    char *ha_upstream;        /* Upstream configuration file      */
+    struct flb_upstream_ha *ha;
+
+    /* Upstream handler and config context for single mode (no HA) */
+    struct flb_upstream *u;
+    struct mk_list configs;
+
+    /* Plugin output instance reference */
+    struct flb_output_instance *ins;
+};
+
 
 #endif
