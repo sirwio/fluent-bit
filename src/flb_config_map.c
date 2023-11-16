@@ -291,6 +291,12 @@ struct mk_list *flb_config_map_create(struct flb_config *config,
             return NULL;
         }
 
+        if (new->name == NULL) {
+            flb_free(new);
+            flb_config_map_destroy(list);
+            return NULL;
+        }
+
         /* Translate default value */
         if (m->def_value) {
             /*

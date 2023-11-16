@@ -26,8 +26,18 @@
 
 #include "opensearch.h"
 
-struct flb_opensearch *flb_os_conf_create(struct flb_output_instance *ins,
-                                          struct flb_config *config);
-int flb_os_conf_destroy(struct flb_opensearch *ctx);
+int os_config_ha(const char *upstream_file,
+                 struct flb_opensearch *ctx,
+                 struct flb_config *config);
+
+int os_config_simple(struct flb_opensearch *ctx,
+                     struct flb_output_instance *ins,
+                     struct flb_config *config);
+
+int flb_os_conf_init(struct flb_opensearch_config *oc,
+
+                     struct flb_opensearch *ctx);
+
+int flb_os_conf_destroy(struct flb_opensearch_config *oc);
 
 #endif
